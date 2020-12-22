@@ -69,47 +69,6 @@ MODEL_CLASSES = {
 }
 
 
-class TextDataset(Dataset):
-    def __init__(self, tokenizer, file_path='train', block_size=512):
-        assert os.path.isfile(file_path)
-        directory, filename = os.path.split(file_path)
-        cached_features_file = os.path.join(directory, 'cached_lm_' + str(block_size) + '_' + filename)
-
-        if os.path.exists(cached_features_file):
-            logger.info("Loading features from cached file %s", cached_features_file)
-            with open(cached_features_file, 'rb') as handle:
-                self.examples = pickle.load(handle)
-        else:
-            logger.info("Creating features from dataset file at %s", directory)
-
-            self.examples = []
-            with open(file_path, encoding="utf-8") as f:
-                text = f.read()
-
-            tokenized_text = tokenizer.convert_tokens_to_ids(tokenizer.tokenize(text))
-
-            for i in range(0, len(tokenized_text)-block_size+1, block_size): # Truncate in block of block_size
-                self.examples.append(tokenizer.build_inputs_with_special_tokens(tokenized_text[i:i+block_size]))
-            # Note that we are loosing the last truncated example here for the sake of simplicity (no padding)
-            # If your dataset is small, first you should loook for a bigger one :-) and second you
-            # can change this behavior by adding (model specific) padding.
-
-            logger.info("Saving features into cached file %s", cached_features_file)
-            with open(cached_features_file, 'wb') as handle:
-                pickle.dump(self.examples, handle, protocol=pickle.HIGHEST_PROTOCOL)
-
-    def __len__(self):
-        return len(self.examples)
-
-    def __getitem__(self, item):
-        return torch.tensor(self.examples[item])
-
-
-def load_and_cache_examples(args, tokenizer, evaluate=False):
-    dataset = TextDataset(tokenizer, file_path=args.eval_data_file if evaluate else args.train_data_file, block_size=args.block_size)
-    return dataset
-
-
 def set_seed(args):
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -118,40 +77,11 @@ def set_seed(args):
         torch.cuda.manual_seed_all(args.seed)
 
 
-def _rotate_checkpoints(args, checkpoint_prefix, use_mtime=False):
-    if not args.save_total_limit:
-        return
-    if args.save_total_limit <= 0:
-        return
-
-    # Check if we should delete older checkpoint(s)
-    glob_checkpoints = glob.glob(os.path.join(args.output_dir, '{}-*'.format(checkpoint_prefix)))
-    if len(glob_checkpoints) <= args.save_total_limit:
-        return
-
-    ordering_and_checkpoint_path = []
-    for path in glob_checkpoints:
-        if use_mtime:
-            ordering_and_checkpoint_path.append((os.path.getmtime(path), path))
-        else:
-            regex_match = re.match('.*{}-([0-9]+)'.format(checkpoint_prefix), path)
-            if regex_match and regex_match.groups():
-                ordering_and_checkpoint_path.append((int(regex_match.groups()[0]), path))
-
-    checkpoints_sorted = sorted(ordering_and_checkpoint_path)
-    checkpoints_sorted = [checkpoint[1] for checkpoint in checkpoints_sorted]
-    number_of_checkpoints_to_delete = max(0, len(checkpoints_sorted) - args.save_total_limit)
-    checkpoints_to_be_deleted = checkpoints_sorted[:number_of_checkpoints_to_delete]
-    for checkpoint in checkpoints_to_be_deleted:
-        logger.info("Deleting older checkpoint [{}] due to args.save_total_limit".format(checkpoint))
-        shutil.rmtree(checkpoint)
-
-
-def mask_tokens(inputs, tokenizer, args):
+def mask_tokens(inputs, tokenizer):
     """ Prepare masked tokens inputs/labels for masked language modeling: 80% MASK, 10% random, 10% original. """
     labels = inputs.clone()
     # We sample a few tokens in each sequence for masked-LM training (with probability args.mlm_probability defaults to 0.15 in Bert/RoBERTa)
-    probability_matrix = torch.full(labels.shape, args.mlm_probability)
+    probability_matrix = torch.full(labels.shape, 0.15)
     special_tokens_mask = [tokenizer.get_special_tokens_mask(val, already_has_special_tokens=True) for val in labels.tolist()]
     probability_matrix.masked_fill_(torch.tensor(special_tokens_mask, dtype=torch.bool), value=0.0)
     masked_indices = torch.bernoulli(probability_matrix).bool()
@@ -170,16 +100,15 @@ def mask_tokens(inputs, tokenizer, args):
     return inputs, labels
 
 
-def train(args, train_dataset, model, tokenizer):
+def train(train_dataset, model, tokenizer):
     """ Train the model """
-    if args.local_rank in [-1, 0]:
-        tb_writer = SummaryWriter()
-
+    max_steps = 50000
+    
     args.train_batch_size = args.per_gpu_train_batch_size * max(1, args.n_gpu)
     train_sampler = RandomSampler(train_dataset) if args.local_rank == -1 else DistributedSampler(train_dataset)
     train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size)
 
-    if args.max_steps > 0:
+    if max_steps > 0:
         t_total = args.max_steps
         args.num_train_epochs = args.max_steps // (len(train_dataloader) // args.gradient_accumulation_steps) + 1
     else:
